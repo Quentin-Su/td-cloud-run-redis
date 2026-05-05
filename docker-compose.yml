@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  redis-local:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  app-jeu:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_HOST=redis-local
+      - REDIS_PORT=6379
+      - HOSTNAME=mon-ordi-local
+      - ADMIN_KEY=test-secret
+      - GCP_PROJECT_ID=local-test
+      - REGION=europe-west1
+    depends_on:
+      - redis-local

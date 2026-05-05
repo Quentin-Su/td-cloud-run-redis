@@ -1,12 +1,16 @@
 import os
+
 import json
+import threading
 from datetime import datetime, timezone
+
 import redis
+import threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-from google.cloud import pubsub_v1
-import threading
+
+from google.cloud import pubsub_v1, tasks_v2, storage, firestore
 
 
 app = Flask(__name__)
@@ -18,13 +22,10 @@ r = redis.Redis(
     decode_responses=True
 )
 
-# SocketIO
 socketio = SocketIO(
     app,
-    async_mode='threading',
     cors_allowed_origins="*",
-    ping_timeout=60,
-    ping_interval=25
+    async_mode='threading'
 )
 
 # HOSTNAME est exposé automatiquement par Cloud Run. 
@@ -32,9 +33,14 @@ socketio = SocketIO(
 # même si Cloud Run scale le même service à plusieurs conteneurs.
 # En local, la variable n'existe pas — on utilise "local" par défaut.
 SERVER_ID = os.environ.get("K_SERVICE", "local")
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "tp-cloud-tasks-firestore")
+GCP_REGION = os.environ.get("REGION", "europe-west1")
 
-# GCP Pub/Sub
-GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "mon-projet-gcp-game-redis")
+db = firestore.Client()
+storage_client = storage.Client()
+tasks_client = tasks_v2.CloudTasksClient()
+
+# Pub/Sub Configuration
 TOPIC_NAME = os.environ.get("TOPIC_NAME", "events-topic")
 SUBSCRIPTION_NAME = os.environ.get("SUBSCRIPTION_NAME", "events-subscription-1")
 
@@ -44,56 +50,90 @@ subscriber = pubsub_v1.SubscriberClient()
 TOPIC_PATH = publisher.topic_path(GCP_PROJECT_ID, TOPIC_NAME)
 SUBSCRIPTION_PATH = subscriber.subscription_path(GCP_PROJECT_ID, SUBSCRIPTION_NAME)
 
+# Cloud Tasks & Storage Configuration
+TASK_QUEUE = os.environ.get("TASK_QUEUE", "")
+PROCESSOR_URL = os.environ.get("PROCESSOR_URL", "")
+SNAPSHOT_BUCKET = os.environ.get("SNAPSHOT_BUCKET", "")
 
-def pubsub_callback(message):
+# Rate Limiting Settings
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", 10))
+RATE_WINDOW = 60
+PROTECTED_ROUTES = {"/publish"}
+
+
+@app.before_request
+def rate_limit_middleware():
+    if request.path not in PROTECTED_ROUTES:
+        return
+
+    if request.method != "POST":
+        return
+    
+    body = request.get_json(silent=True) or {}
+    player_id = request.headers.get("X-Player-ID", "anonymous")
+
     try:
-        redis_key = message.data.decode("utf-8")
-        print("Pub/Sub reçu:", redis_key)
-
-        value = r.get(redis_key)
-
-        if value:
-            data = json.loads(value)
-
-            socketio.emit("update", {
-                "key": redis_key,
-                "data": data
-            })
-
-        message.ack()
-
+        allowed = _check_rate_limit(player_id)
     except Exception as e:
-        print("Erreur Pub/Sub callback:", e)
+        app.logger.error(f"Rate limit check failed: {e}")
+        return
+
+    if not allowed:
+        return jsonify({
+            "error":   "Rate limit exceeded",
+            "limit":   RATE_LIMIT,
+            "window":  f"{RATE_WINDOW}s",
+            "player_id": player_id
+        }), 429
 
 
-@socketio.on("connect")
-def handle_connect():
-    print(f"Client connecté à l'instance {SERVER_ID}")
+@firestore.transactional
+def _update_rate_limit(transaction, doc_ref, now):
+    snapshot = doc_ref.get(transaction=transaction)
+    data = snapshot.to_dict() if snapshot.exists else {}
 
-    result = {}
-    cursor = 0
+    window_start = data.get("window_start")
+    count = data.get("count", 0)
 
-    while True:
-        cursor, keys = r.scan(cursor=cursor, match="event:*", count=100)
-        for key in keys:
-            value = r.get(key)
-            ttl   = r.ttl(key)
-            if value:
-                result[key] = {"data": json.loads(value), "ttl_remaining_seconds": ttl}
-        if cursor == 0:
-            break
+    if window_start is None or (now - window_start.timestamp()) > RATE_WINDOW:
+        count = 0
+        window_start = now
 
-    emit("initial_state", {
-        "server_id": SERVER_ID,
-        "count": len(result),
-        "entries": result,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+    if count >= RATE_LIMIT:
+        return False
+
+    transaction.set(doc_ref, {
+        "count": count + 1,
+        "window_start": datetime.fromtimestamp(window_start if isinstance(window_start, float) else window_start.timestamp(), tz=timezone.utc),
+        "last_request": datetime.now(timezone.utc),
     })
 
+    return True
 
-@socketio.on("disconnect")
-def handle_disconnect():
-    print(f"Client déconnecté de l'instance {SERVER_ID}")
+
+def _check_rate_limit(player_id: str) -> bool:
+    doc_ref = db.collection("rate_limits").document(player_id)
+    transaction = db.transaction()
+    now = datetime.now(timezone.utc).timestamp()
+    return _update_rate_limit(transaction, doc_ref, now)
+
+
+def _create_snapshot_task(redis_key: str):
+    queue_path = tasks_client.queue_path(GCP_PROJECT_ID, GCP_REGION, TASK_QUEUE)
+    payload = json.dumps({"redis_key": redis_key}).encode()
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": f"{PROCESSOR_URL}/process",
+            "headers": {"Content-Type": "application/json"},
+            "body": payload,
+        }
+    }
+    tasks_client.create_task(request={
+        "parent": queue_path,
+        "task": task
+    })
 
 
 @app.route("/publish", methods=["POST"])
@@ -102,7 +142,7 @@ def publish():
 
     if "message" not in data:
         return jsonify({"error": "Champ 'message' requis"}), 400
-    
+
     # Le serveur enrichit la donnée avant de l'écrire dans Redis.
     # Le client n'a pas à connaître l'identité du serveur ni l'heure.
     entry = {
@@ -111,13 +151,19 @@ def publish():
         "published_at": datetime.now(timezone.utc).isoformat()
     }
 
-    # La clé Redis inclut server_id et published_at pour être unique. 
+    # La clé Redis inclut server_id et published_at pour être unique.
     # setex écrit la valeur avec un TTL de 3600 secondes (1 heure).
     key = f"event:{SERVER_ID}:{entry['published_at']}"
     r.setex(key, 3600, json.dumps(entry))
 
-    # Publier le message sur Pub/Sub
-    publisher.publish(TOPIC_PATH, key.encode("utf-8"))
+    if publisher and TOPIC_PATH:
+        publisher.publish(TOPIC_PATH, key.encode())
+
+    if GCP_PROJECT_ID and TASK_QUEUE and PROCESSOR_URL:
+        _create_snapshot_task(key)
+
+    player_id = request.headers.get("X-Player-ID", "anonymous")
+    _update_analytics_async(player_id)
 
     return jsonify({
         "status": "published",
@@ -126,61 +172,195 @@ def publish():
     })
 
 
+@app.route("/process", methods=["POST"])
+def process():
+    body = request.get_json()
+    trigger_key = body.get("redis_key")
+
+    if not trigger_key:
+        return jsonify({"error": "redis_key manquant"}), 400
+    
+    trigger_data = r.get(trigger_key)
+
+    if not trigger_data:
+        return jsonify({
+            "status": "skipped",
+            "reason": "key expired"
+        }), 200
+    
+    game_state = {}
+    cursor = 0
+
+    while True:
+        cursor, keys = r.scan(cursor=cursor, match="event:*", count=100)
+
+        for key in keys:
+            value = r.get(key)
+            if value:
+                game_state[key] = json.loads(value)
+
+        if cursor == 0:
+            break
+
+    snapshot = {
+        "snapshot_at": datetime.now(timezone.utc).isoformat(),
+        "trigger_key": trigger_key,
+        "trigger_event": json.loads(trigger_data),
+        "game_state": game_state,
+        "event_count": len(game_state),
+    }
+
+    now = datetime.now(timezone.utc)
+    blob_name = f"snapshots/{now.strftime('%Y-%m-%d')}/{now.timestamp():.0f}.json"
+    bucket = storage_client.bucket(SNAPSHOT_BUCKET)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(
+        json.dumps(snapshot, indent=2),
+        content_type="application/json"
+    )
+
+    return jsonify({
+        "status": "snapshot_saved",
+        "blob": blob_name,
+        "event_count": len(game_state)
+    }), 200
+
+
+@app.route("/analytics")
+def analytics():
+    if request.headers.get("X-Admin-Key") != os.environ.get("ADMIN_KEY", "changeme"):
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    results = {}
+    for doc in db.collection("analytics").stream():
+        results[doc.id] = doc.to_dict()
+
+    quotas = {}
+    for doc in db.collection("rate_limits").stream():
+        quotas[doc.id] = doc.to_dict()
+
+    return jsonify({
+        "server_id": SERVER_ID,
+        "analytics": results,
+        "quotas": quotas
+    })
+
+
 @app.route("/data")
 def data():
-    # SCAN parcourt les clés par lots sans bloquer le serveur Redis. 
-    # KEYS("event:*") ferait la même chose mais bloque Redis le temps de parcourir 
+    # SCAN parcourt les clés par lots sans bloquer le serveur Redis.
+    # KEYS("event:*") ferait la même chose mais bloque Redis le temps de parcourir
     # toutes les clés — inacceptable en production sur de gros volumes.
     result = {}
     cursor = 0
 
     while True:
         cursor, keys = r.scan(cursor=cursor, match="event:*", count=100)
+
         for key in keys:
             value = r.get(key)
             ttl   = r.ttl(key)
+
             if value:
-                result[key] = {"data": json.loads(value), "ttl_remaining_seconds": ttl}
+                result[key] = {
+                    "data": json.loads(value),
+                    "ttl_remaining_seconds": ttl
+                }
+                               
         if cursor == 0:
             break
-    return jsonify({"server_id": SERVER_ID, "count": len(result), "entries": result, "timestamp": datetime.now(timezone.utc).isoformat()})
 
+    return jsonify({
+        "server_id": SERVER_ID,
+        "count": len(result),
+        "entries": result,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+        
 
 @app.route("/health")
 def health():
     try:
         r.ping()
-        return jsonify({"status": "healthy", "server_id": SERVER_ID, "redis": "connected"}), 200
+        return jsonify({
+            "status": "healthy",
+            "server_id": SERVER_ID,
+            "redis": "connected",
+        }), 200
     except Exception as e:
-        return jsonify({"status": "unhealthy", "error": str(e)}), 503
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 503
 
 
-def start_pubsub_listener():
-    print("Démarrage listener Pub/Sub...")
+@socketio.on('connect')
+def handle_connect():
+    result = {}
 
-    streaming_pull_future = subscriber.subscribe(
-        SUBSCRIPTION_PATH,
-        callback=pubsub_callback
-    )
+    for key in r.scan_iter("event:*"):
+        val = r.get(key)
+        if val:
+            result[key] = json.loads(val)
+    
+    emit('initial_state', {
+        "server_id": SERVER_ID,
+        "data": result
+    })
 
-    print("Listener Pub/Sub actif")
 
+def _update_analytics_async(player_id: str):
+    def _write():
+        try:
+            doc_ref = db.collection("analytics").document(player_id)
+            doc_ref.set({
+                "total_requests": firestore.Increment(1),
+                "last_seen": datetime.now(timezone.utc),
+            }, merge=True)
+        except Exception as e:
+            app.logger.warning(f"Analytics write failed: {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
+
+
+def listen_to_pubsub():
+    if not GCP_PROJECT_ID or not SUBSCRIPTION_NAME:
+        print("Pub/Sub listener désactivé (variables manquantes).")
+        return
+
+    print(f"[*] Démarrage de l'écouteur sur : {SUBSCRIPTION_PATH}")
+
+    def callback(message):
+        try:
+            key = message.data.decode("utf-8")
+            data = r.get(key)
+
+            if data:
+                socketio.emit("update", {
+                    "key": key,
+                    "data": data
+                })
+            message.ack()
+        except Exception as e:
+            print(f"Erreur callback Pub/Sub: {e}")
+
+    streaming_pull_future = subscriber.subscribe(SUBSCRIPTION_PATH, callback=callback)
+    
     try:
         streaming_pull_future.result()
     except Exception as e:
-        print("Erreur listener Pub/Sub:", e)
-        streaming_pull_future.cancel()
+        print(f"Erreur écouteur Pub/Sub: {e}")
+
+if SUBSCRIPTION_NAME:
+    threading.Thread(target=listen_to_pubsub, daemon=True).start()
 
 
 if __name__ == "__main__":
-    threading.Thread(
-        target=start_pubsub_listener,
-        daemon=True
-    ).start()
-
     socketio.run(
         app,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8080)),
-        debug=True
+        use_reloader=False,
+        debug=True,
+        log_output=True
     )
