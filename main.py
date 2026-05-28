@@ -11,6 +11,9 @@ from flask_cors import CORS
 from flask_socketio import SocketIO, emit
 
 from google.cloud import pubsub_v1, tasks_v2, storage, firestore
+from google.cloud import monitoring_v3
+
+import time
 
 
 app = Flask(__name__)
@@ -60,6 +63,9 @@ RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", 10))
 RATE_WINDOW = 60
 PROTECTED_ROUTES = {"/publish"}
 
+monitoring_client = monitoring_v3.MetricServiceClient()
+MONITORING_PROJECT_NAME = f"projects/{GCP_PROJECT_ID}"
+
 
 @app.before_request
 def rate_limit_middleware():
@@ -73,22 +79,24 @@ def rate_limit_middleware():
     player_id = request.headers.get("X-Player-ID", "anonymous")
 
     try:
-        allowed = _check_rate_limit(player_id)
+        allowed, player_limit = _check_rate_limit(player_id)
     except Exception as e:
         app.logger.error(f"Rate limit check failed: {e}")
         return
 
     if not allowed:
+        _record_rate_limit_event(player_id)
+
         return jsonify({
             "error":   "Rate limit exceeded",
-            "limit":   RATE_LIMIT,
+            "limit":   player_limit,
             "window":  f"{RATE_WINDOW}s",
             "player_id": player_id
         }), 429
 
 
 @firestore.transactional
-def _update_rate_limit(transaction, doc_ref, now):
+def _update_rate_limit(transaction, doc_ref, now, player_limit):
     snapshot = doc_ref.get(transaction=transaction)
     data = snapshot.to_dict() if snapshot.exists else {}
 
@@ -99,7 +107,7 @@ def _update_rate_limit(transaction, doc_ref, now):
         count = 0
         window_start = now
 
-    if count >= RATE_LIMIT:
+    if count >= player_limit:
         return False
 
     transaction.set(doc_ref, {
@@ -111,11 +119,26 @@ def _update_rate_limit(transaction, doc_ref, now):
     return True
 
 
-def _check_rate_limit(player_id: str) -> bool:
+def _get_player_rate_limit(player_id: str) -> int:
+    try:
+        doc = db.collection("players").document(player_id).get()
+        if doc.exists:
+            return int(doc.to_dict().get("rate_limit", RATE_LIMIT))
+    except Exception as e:
+        app.logger.warning(f"Impossible de lire le quota Firestore pour {player_id}: {e}")
+
+    return RATE_LIMIT
+
+
+
+def _check_rate_limit(player_id: str) -> tuple[bool, int]:
+    player_limit = _get_player_rate_limit(player_id)
     doc_ref = db.collection("rate_limits").document(player_id)
     transaction = db.transaction()
     now = datetime.now(timezone.utc).timestamp()
-    return _update_rate_limit(transaction, doc_ref, now)
+    allowed = _update_rate_limit(transaction, doc_ref, now, player_limit)
+
+    return allowed, player_limit
 
 
 def _create_snapshot_task(redis_key: str):
@@ -178,7 +201,9 @@ def process():
     trigger_key = body.get("redis_key")
 
     if not trigger_key:
-        return jsonify({"error": "redis_key manquant"}), 400
+        return jsonify({
+            "error": "redis_key manquant"
+        }), 400
     
     trigger_data = r.get(trigger_key)
 
@@ -292,6 +317,75 @@ def health():
             "status": "unhealthy",
             "error": str(e)
         }), 503
+    
+
+@app.route("/snapshots", methods=["GET"])
+def snapshots():
+    if not SNAPSHOT_BUCKET:
+        return jsonify({
+            "error": "SNAPSHOT_BUCKET non configuré"
+        }), 500
+
+    bucket = storage_client.bucket(SNAPSHOT_BUCKET)
+    requested_file = request.args.get("file")
+
+    # GET /snapshots?file=...
+    # Snapshot content
+    if requested_file:
+        blob = bucket.blob(requested_file)
+
+        if not blob.exists():
+            return jsonify({
+                "error": "Snapshot introuvable",
+                "file": requested_file
+            }), 404
+
+        try:
+            content = blob.download_as_text()
+            snapshot_data = json.loads(content)
+
+            return jsonify({
+                "status": "loaded",
+                "snapshot": snapshot_data
+            }), 200
+
+        except Exception as e:
+            return jsonify({
+                "error": "Impossible de lire le snapshot",
+                "details": str(e)
+            }), 500
+
+    # GET /snapshots
+    # Snapshots list
+    try:
+        blobs = storage_client.list_blobs(
+            SNAPSHOT_BUCKET,
+            prefix="snapshots/"
+        )
+
+        snapshots = []
+
+        for blob in blobs:
+            snapshots.append({
+                "name": blob.name,
+                "size_bytes": blob.size,
+                "updated": blob.updated.isoformat() if blob.updated else None,
+                "generation": blob.generation,
+            })
+
+        snapshots.sort(key=lambda x: x["updated"] or "", reverse=True)
+
+        return jsonify({
+            "bucket": SNAPSHOT_BUCKET,
+            "count": len(snapshots),
+            "snapshots": snapshots
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "error": "Erreur listing snapshots",
+            "details": str(e)
+        }), 500
 
 
 @socketio.on('connect')
@@ -321,6 +415,46 @@ def _update_analytics_async(player_id: str):
             app.logger.warning(f"Analytics write failed: {e}")
 
     threading.Thread(target=_write, daemon=True).start()
+
+
+def _record_rate_limit_event(player_id: str):
+    def _send():
+        try:
+            series = monitoring_v3.TimeSeries()
+            now = time.time()
+
+            series.metric.type = "custom.googleapis.com/api/rate_limit_exceeded"
+
+            series.metric.labels.update({
+                "player_id": player_id,
+                "server_id": SERVER_ID
+            })
+
+            series.resource.type = "global"
+            series.resource.labels.update({
+                "project_id": GCP_PROJECT_ID
+            })
+
+            point = monitoring_v3.Point()
+
+            # métrique GAUGE
+            point.value.int64_value = 1
+
+            point.interval = monitoring_v3.TimeInterval(
+                end_time={"seconds": int(now)}
+            )
+
+            series.points = [point]
+
+            monitoring_client.create_time_series(
+                name=MONITORING_PROJECT_NAME,
+                time_series=[series]
+            )
+
+        except Exception as e:
+            app.logger.warning(f"Monitoring metric failed: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 def listen_to_pubsub():

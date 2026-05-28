@@ -9,3 +9,4 @@ google-cloud-pubsub==2.27.1
 google-cloud-tasks==2.16.3
 google-cloud-storage==2.16.0
 google-cloud-firestore==2.19.0
+google-cloud-monitoring==2.23.1
